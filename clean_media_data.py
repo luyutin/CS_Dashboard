@@ -1,0 +1,854 @@
+#!/usr/bin/env python3
+"""Detect and standardize media-report tables in otherwise unknown Excel files.
+
+The detector asks a local Ollama model to identify and map the header row,
+validates the rows below it, then exports the detected table using the system
+schema. If Ollama is unavailable, the original deterministic rules are used.
+
+Examples:
+    python clean_media_data.py input.xlsx
+    python clean_media_data.py "0_其他資料/Raw Data_for Louis" -o cleaned_output
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import re
+import sys
+import urllib.error
+import urllib.request
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Iterable
+
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+except ImportError as exc:  # pragma: no cover - gives a useful CLI error
+    raise SystemExit("缺少 openpyxl；請先執行：pip install openpyxl") from exc
+
+
+TARGET_COLUMNS = [
+    "date",
+    "source",
+    "campaign_name",
+    "impressions",
+    "clicks",
+    "click_through_rate",
+    "completed_views",
+    "video_completion_rate",
+    "25_percent_views",
+    "50_percent_views",
+    "75_percent_views",
+    "ad_type",
+]
+
+# Explicit aliases cover the local-media samples. The report dictionary is also
+# loaded at runtime, so its Chinese/English canonical names remain the authority.
+ALIASES: dict[str, tuple[str, ...]] = {
+    "date": ("日期", "date", "day", "走期", "reporting starts"),
+    "campaign_name": (
+        "廣告活動", "廣告活動名稱", "行銷活動名稱", "campaign", "campaign name",
+        "訂單名稱", "訂單項名稱", "廣告名稱", "圖像廣告名稱", "素材名稱",
+    ),
+    "impressions": (
+        "曝光", "曝光數", "曝光次數", "總曝光數", "展示量", "impressions", "impr.",
+    ),
+    "clicks": (
+        "點擊", "點擊數", "點擊量", "總點擊數", "總點擊次數", "clicks", "clicks (all)",
+    ),
+    "click_through_rate": (
+        "點擊率", "點擊率(%)", "點擊率 (%)", "點閱率", "ctr", "ctr (all)",
+    ),
+    "completed_views": (
+        "完整觀看數", "完整觀看次數", "總觀看完成數", "100%觀看", "觀看完成數",
+        "video played to 100%", "video played to 100% 的次數",
+    ),
+    "video_completion_rate": (
+        "完整觀看率", "完整觀看率(%)", "完整觀看率 (%)", "觀看完成率", "vtr",
+        "收視率", "view rate", "completion rate (video)", "3\" vtr (view through rate)",
+    ),
+    "25_percent_views": ("25%觀看", "影片播放進度：25%", "video played to 25%"),
+    "50_percent_views": ("50%觀看", "影片播放進度：50%", "video played to 50%"),
+    "75_percent_views": ("75%觀看", "影片播放進度：75%", "video played to 75%"),
+    "ad_type": ("廣告格式", "媒體 / 格式", "媒體/格式", "ad type", "format"),
+}
+
+IMPRESSION_MARKERS = ("曝光", "展示量", "impression", "impr.")
+DATE_MARKERS = ("日期", "date", "day", "走期", "reporting starts")
+SUMMARY_MARKERS = ("合計", "總計", "total", "subtotal")
+PREFERRED_SHEETS = ("daily", "每日", "by day", "byday")
+
+TARGET_DESCRIPTIONS = {
+    "date": "報表日期、投放日期或 reporting date",
+    "campaign_name": "廣告活動、訂單、素材或 campaign 名稱",
+    "impressions": "曝光數、展示次數或 impressions",
+    "clicks": "點擊數或 clicks",
+    "click_through_rate": "點擊率、CTR（百分比）",
+    "completed_views": "僅限影片完整或播放至 100% 的次數；一般 video views 不屬於此欄",
+    "video_completion_rate": "影片完整觀看率、VTR、view/completion rate（必須是百分比率）",
+    "25_percent_views": "僅限明確寫出影片播放至 25% 的次數",
+    "50_percent_views": "僅限明確寫出影片播放至 50% 的次數",
+    "75_percent_views": "僅限明確寫出影片播放至 75% 的次數",
+    "ad_type": "廣告格式、媒體格式或 ad type；頻率、觸及人數不是廣告格式",
+}
+
+
+# ---------------------------------------------------------------------------
+# Internal data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Candidate:
+    """A row that looks like the header of a real data table."""
+
+    sheet: str
+    header_row: int
+    score: float
+    headers: list[str]
+    mapped: dict[int, str]
+    unmapped: list[str]
+    data_rows: int
+
+
+@dataclass
+class AuditRecord:
+    """Information written to cleaning_audit.json after each attempted import."""
+
+    input_file: str
+    sheet: str
+    header_row: int | None
+    status: str
+    score: float | None
+    data_rows: int
+    mapped_columns: dict[str, str]
+    unmapped_columns: list[str]
+    output_file: str | None
+
+
+@dataclass
+class OllamaConfig:
+    """Connection settings for local LLM-assisted header detection."""
+
+    model: str = "qwen3.5:9b"
+    url: str = "http://127.0.0.1:11434"
+    timeout: float = 120.0
+    enabled: bool = True
+    warned: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Small value/type helpers
+# ---------------------------------------------------------------------------
+
+def clean_text(value: Any) -> str:
+    """Convert a cell to trimmed single-line text for comparison/reporting."""
+    if value is None:
+        return ""
+    text = str(value).replace("\n", " ").replace("\r", " ").strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def normalize(value: Any) -> str:
+    """Normalize spelling/spacing so visually equivalent headers will match."""
+    text = clean_text(value).lower()
+    text = text.replace("（", "(").replace("）", ")").replace("％", "%")
+    return re.sub(r"[\s_:/：,，。·・\-]+", "", text)
+
+
+def is_blank(value: Any) -> bool:
+    """Treat None, empty strings and vendor dash placeholders as blank."""
+    return value is None or clean_text(value) in {"", "--", "—"}
+
+
+def is_error(value: Any) -> bool:
+    """Return True for Excel error strings such as #DIV/0!."""
+    return isinstance(value, str) and value.startswith("#")
+
+
+def looks_like_date(value: Any) -> bool:
+    """Quickly test whether a candidate column contains date-like values."""
+    if isinstance(value, (datetime, date)):
+        return True
+    if isinstance(value, (int, float)) and 20_000 <= value <= 80_000:
+        return True
+    text = clean_text(value)
+    return bool(
+        re.fullmatch(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", text)
+        or re.fullmatch(r"\d{1,2}[-/]\d{1,2}(?:[-/]\d{1,2})?", text)
+    )
+
+
+def looks_like_data(value: Any) -> bool:
+    """Distinguish ordinary data cells from blank/error cells."""
+    if is_blank(value) or is_error(value):
+        return False
+    if isinstance(value, (int, float, datetime, date)):
+        return True
+    text = clean_text(value).replace(",", "").replace("%", "")
+    try:
+        float(text)
+        return True
+    except ValueError:
+        return len(text) > 0
+
+
+def coerce_excel_date(value: Any) -> datetime | date | None:
+    """Return a real Excel date value instead of leaving date-looking text."""
+    if isinstance(value, (datetime, date)):
+        return value
+    if isinstance(value, (int, float)) and 20_000 <= value <= 80_000:
+        # openpyxl normally converts formatted serials already. Keep this path
+        # defensive for vendor files whose date cells use General formatting.
+        from openpyxl.utils.datetime import from_excel
+
+        return from_excel(value)
+    text = clean_text(value)
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Header dictionary and matching
+# ---------------------------------------------------------------------------
+
+def read_dictionary(path: Path | None) -> dict[str, set[str]]:
+    """Build target-column aliases from constants plus the supplied dictionary."""
+    aliases = {target: {normalize(a) for a in values} for target, values in ALIASES.items()}
+    if not path or not path.exists():
+        return aliases
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb["字典欄位說明"] if "字典欄位說明" in wb.sheetnames else wb.worksheets[0]
+    canonical_to_target = {
+        "Date": "date",
+        "Campaign name": "campaign_name",
+        "Impressions": "impressions",
+        "Clicks (all)": "clicks",
+        "CTR (All)": "click_through_rate",
+        "Video played to 100%": "completed_views",
+        "Completion Rate (Video)": "video_completion_rate",
+        "View rate": "video_completion_rate",
+        '3" VTR (View Through Rate)': "video_completion_rate",
+        "Video played to 25%": "25_percent_views",
+        "Video played to 50%": "50_percent_views",
+        "Video played to 75%": "75_percent_views",
+        "Campaign Type": "ad_type",
+    }
+    for row in ws.iter_rows(min_row=3, values_only=True):
+        zh, en = row[1] if len(row) > 1 else None, row[2] if len(row) > 2 else None
+        target = canonical_to_target.get(clean_text(en))
+        if not target:
+            continue
+        for value in (zh, en, *(row[7:12] if len(row) >= 12 else [])):
+            if value and clean_text(value) not in {"∅", "NA"}:
+                aliases[target].add(normalize(value))
+    wb.close()
+    return aliases
+
+
+def match_header(header: Any, aliases: dict[str, set[str]]) -> str | None:
+    """Map one source header to a system field, preferring exact matches."""
+    key = normalize(header)
+    if not key:
+        return None
+    exact = [target for target, values in aliases.items() if key in values]
+    if exact:
+        return exact[0]
+    # Conservative fuzzy matching: only long aliases may be contained in a header.
+    matches: list[tuple[int, str]] = []
+    for target, values in aliases.items():
+        for alias in values:
+            if len(alias) >= 4 and (alias in key or key in alias):
+                matches.append((len(alias), target))
+    return max(matches)[1] if matches else None
+
+
+def has_marker(values: Iterable[Any], markers: tuple[str, ...]) -> bool:
+    """Check whether a row contains at least one required keyword."""
+    joined = " | ".join(clean_text(v).lower() for v in values)
+    return any(marker.lower() in joined for marker in markers)
+
+
+# ---------------------------------------------------------------------------
+# Ollama-assisted header detection
+# ---------------------------------------------------------------------------
+
+def compact_cell(value: Any, limit: int = 120) -> str | int | float | bool | None:
+    """Make worksheet values small and JSON-safe before sending them to Ollama."""
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return clean_text(value)[:limit]
+
+
+def header_options_for_ollama(ws: Any, scan_rows: int) -> list[dict[str, Any]]:
+    """Build a compact set of plausible rows plus data samples for one LLM call."""
+    max_row = min(ws.max_row, scan_rows)
+    max_col = min(ws.max_column, 100)
+    base_aliases = {
+        target: {normalize(alias) for alias in names}
+        for target, names in ALIASES.items()
+    }
+    ranked: list[tuple[float, int, list[Any]]] = []
+    for row_idx in range(1, max_row + 1):
+        values = [ws.cell(row_idx, col).value for col in range(1, max_col + 1)]
+        nonblank = [(col, value) for col, value in enumerate(values, 1) if not is_blank(value)]
+        if len(nonblank) < 3:
+            continue
+        text_count = sum(isinstance(value, str) and not is_error(value) for _, value in nonblank)
+        if text_count < 2:
+            continue
+        known_count = sum(match_header(value, base_aliases) is not None for _, value in nonblank)
+        marker_bonus = 20 if has_marker((value for _, value in nonblank), IMPRESSION_MARKERS) else 0
+        score = marker_bonus + known_count * 5 + text_count / len(nonblank) * 5 + min(len(nonblank), 20) / 10
+        ranked.append((score, row_idx, values))
+
+    # Limit prompt size while retaining the strongest structurally plausible rows.
+    selected = sorted(ranked, reverse=True)[:12]
+    selected.sort(key=lambda item: item[1])
+    options: list[dict[str, Any]] = []
+    for _, row_idx, values in selected:
+        headers = [
+            {"column": col, "value": compact_cell(value)}
+            for col, value in enumerate(values, 1)
+            if not is_blank(value)
+        ][:40]
+        sample_rows: list[list[dict[str, Any]]] = []
+        for sample_idx in range(row_idx + 1, min(ws.max_row, row_idx + 2) + 1):
+            sample = [
+                {"column": col, "value": compact_cell(ws.cell(sample_idx, col).value)}
+                for col in range(1, max_col + 1)
+                if not is_blank(ws.cell(sample_idx, col).value)
+            ][:40]
+            if sample:
+                sample_rows.append(sample)
+        options.append({"row": row_idx, "cells": headers, "sample_rows": sample_rows})
+    return options
+
+
+def call_ollama_json(prompt: str, config: OllamaConfig) -> dict[str, Any]:
+    """Call Ollama's local chat API and return one validated JSON object."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "header_row": {"type": "integer", "minimum": 0},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "mappings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "column": {"type": "integer", "minimum": 1},
+                        "target": {"type": "string", "enum": list(TARGET_DESCRIPTIONS)},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    },
+                    "required": ["column", "target", "confidence"],
+                },
+            },
+        },
+        "required": ["header_row", "confidence", "mappings"],
+    }
+    payload = {
+        "model": config.model,
+        "stream": False,
+        "think": False,
+        "format": schema,
+        "options": {"temperature": 0},
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是媒體報表資料工程師。只根據提供的 Excel 候選列，找出真正的資料表表頭，"
+                    "並把欄位對應到指定系統欄位。不要猜測不存在的欄位。若沒有可信表頭，"
+                    "header_row 回傳 0、mappings 回傳空陣列。不要為了填滿欄位而強迫配對；"
+                    "觸及、不重複使用者、頻率、花費及一般影片觀看數等未列出的指標應保持未對應。"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+    }
+    request = urllib.request.Request(
+        f"{config.url.rstrip('/')}/api/chat",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=config.timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"無法呼叫 Ollama：{exc}") from exc
+    content = result.get("message", {}).get("content")
+    if not isinstance(content, str):
+        raise RuntimeError("Ollama 回應缺少 message.content")
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        preview = clean_text(content)[:200]
+        raise RuntimeError(f"Ollama 未回傳有效 JSON：{preview!r}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Ollama 回應不是 JSON object")
+    return parsed
+
+
+def llm_mapping_is_plausible(header: Any, target: str) -> bool:
+    """Reject common LLM metric confusions even when confidence is overstated."""
+    text = clean_text(header).lower()
+    if target == "click_through_rate":
+        return any(marker in text for marker in ("ctr", "click through", "點擊率", "點閱率"))
+    if target == "completed_views":
+        return any(marker in text for marker in ("100", "complete", "完整", "完成"))
+    if target == "video_completion_rate":
+        return any(marker in text for marker in ("rate", "率", "vtr"))
+    if target == "25_percent_views":
+        return "25" in text
+    if target == "50_percent_views":
+        return "50" in text
+    if target == "75_percent_views":
+        return "75" in text
+    if target == "ad_type":
+        return any(marker in text for marker in ("type", "format", "格式", "類型", "媒體 /", "媒體/"))
+    return True
+
+
+def detect_candidate_with_ollama(
+    ws: Any,
+    aliases: dict[str, set[str]],
+    scan_rows: int,
+    config: OllamaConfig,
+) -> Candidate | None:
+    """Ask a local Ollama model to identify the header row and map its columns."""
+    options = header_options_for_ollama(ws, scan_rows)
+    if not options:
+        return None
+    prompt = (
+        "系統欄位定義：\n"
+        f"{json.dumps(TARGET_DESCRIPTIONS, ensure_ascii=False, indent=2)}\n\n"
+        "候選列（column 是 Excel 的 1-based 欄號；sample_rows 是其下方資料範例）：\n"
+        f"{json.dumps(options, ensure_ascii=False)}\n\n"
+        "選出一個 header_row。每個 target 最多對應一次；impressions 是有效媒體資料表的必要欄位。"
+    )
+    result = call_ollama_json(prompt, config)
+    try:
+        header_row = int(result.get("header_row", 0))
+        confidence = max(0.0, min(float(result.get("confidence", 0)), 1.0))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Ollama 回傳的 header_row/confidence 格式錯誤") from exc
+    if header_row < 1 or header_row > min(ws.max_row, scan_rows):
+        return None
+
+    max_col = min(ws.max_column, 100)
+    raw_headers = [ws.cell(header_row, col).value for col in range(1, max_col + 1)]
+    # Deterministic dictionary matches are more precise; Ollama fills only gaps.
+    mapped: dict[int, str] = {}
+    used_targets: set[str] = set()
+    for col, value in enumerate(raw_headers, 1):
+        if is_blank(value):
+            continue
+        target = match_header(value, aliases)
+        if target and target not in used_targets:
+            mapped[col] = target
+            used_targets.add(target)
+
+    mappings = result.get("mappings", [])
+    if not isinstance(mappings, list):
+        raise RuntimeError("Ollama 回傳的 mappings 格式錯誤")
+    for item in mappings:
+        if not isinstance(item, dict):
+            continue
+        try:
+            col = int(item.get("column"))
+        except (TypeError, ValueError):
+            continue
+        target = item.get("target")
+        try:
+            mapping_confidence = float(item.get("confidence", 0))
+        except (TypeError, ValueError):
+            continue
+        if (
+            1 <= col <= max_col
+            and mapping_confidence >= 0.75
+            and target in TARGET_DESCRIPTIONS
+            and target not in used_targets
+            and not is_blank(raw_headers[col - 1])
+            and col not in mapped
+            and llm_mapping_is_plausible(raw_headers[col - 1], target)
+        ):
+            mapped[col] = target
+            used_targets.add(target)
+
+    if "impressions" not in used_targets:
+        return None
+
+    checked = 0
+    data_like = 0
+    for row_idx in range(header_row + 1, min(ws.max_row, header_row + 8) + 1):
+        filled = [
+            ws.cell(row_idx, col).value
+            for col in range(1, max_col + 1)
+            if not is_blank(ws.cell(row_idx, col).value)
+        ]
+        if not filled:
+            continue
+        checked += 1
+        if sum(looks_like_data(value) for value in filled) >= max(2, math.ceil(len(filled) * 0.5)):
+            data_like += 1
+    if checked == 0 or data_like / checked < 0.5:
+        return None
+
+    unmapped = [
+        clean_text(value)
+        for col, value in enumerate(raw_headers, 1)
+        if not is_blank(value) and col not in mapped
+    ]
+    score = confidence * 100 + len(mapped) * 10 + data_like / checked * 10
+    return Candidate(
+        sheet=ws.title,
+        header_row=header_row,
+        score=round(score, 2),
+        headers=[clean_text(value) for value in raw_headers],
+        mapped=mapped,
+        unmapped=unmapped,
+        data_rows=0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Table detection
+# ---------------------------------------------------------------------------
+
+def detect_candidates(ws: Any, aliases: dict[str, set[str]], scan_rows: int) -> list[Candidate]:
+    """Find and score plausible header rows within one worksheet.
+
+    A row is not accepted merely because it contains the word "曝光". It must
+    also contain several non-empty headers and be followed by data-like rows.
+    """
+    candidates: list[Candidate] = []
+    max_row = min(ws.max_row, scan_rows)
+    max_col = min(ws.max_column, 100)
+    for row_idx in range(1, max_row + 1):
+        raw_headers = [ws.cell(row_idx, col).value for col in range(1, max_col + 1)]
+        if not has_marker(raw_headers, IMPRESSION_MARKERS):
+            continue
+
+        nonblank = [v for v in raw_headers if not is_blank(v)]
+        if len(nonblank) < 3:
+            continue
+
+        mapped: dict[int, str] = {}
+        used_targets: set[str] = set()
+        unmapped: list[str] = []
+        for col, value in enumerate(raw_headers, start=1):
+            if is_blank(value):
+                continue
+            target = match_header(value, aliases)
+            if target and target not in used_targets:
+                mapped[col] = target
+                used_targets.add(target)
+            elif not target:
+                unmapped.append(clean_text(value))
+
+        # Validate the next few rows. This rejects report titles such as
+        # "保證曝光數 / 曝光達成率", which contain the keyword but are not tables.
+        checked = 0
+        data_like = 0
+        date_like = 0
+        for r in range(row_idx + 1, min(ws.max_row, row_idx + 8) + 1):
+            values = [ws.cell(r, c).value for c in range(1, max_col + 1)]
+            filled = [v for v in values if not is_blank(v)]
+            if not filled:
+                continue
+            checked += 1
+            if sum(looks_like_data(v) for v in filled) >= max(2, math.ceil(len(filled) * 0.5)):
+                data_like += 1
+            date_col = next((c for c, t in mapped.items() if t == "date"), None)
+            if date_col and looks_like_date(ws.cell(r, date_col).value):
+                date_like += 1
+
+        if checked == 0 or data_like / checked < 0.6 or "impressions" not in used_targets:
+            continue
+
+        score = len(mapped) * 10 + (data_like / checked) * 10
+        if "date" in used_targets:
+            score += 25 + min(date_like, 5) * 2
+        if any(marker in ws.title.lower() for marker in PREFERRED_SHEETS):
+            score += 30
+        if row_idx > 1:
+            score += 2  # Real vendor reports commonly have title bands above the table.
+        candidates.append(
+            Candidate(
+                sheet=ws.title,
+                header_row=row_idx,
+                score=round(score, 2),
+                headers=[clean_text(v) for v in raw_headers],
+                mapped=mapped,
+                unmapped=unmapped,
+                data_rows=0,
+            )
+        )
+    return candidates
+
+
+def select_candidate(
+    workbook: Any,
+    aliases: dict[str, set[str]],
+    scan_rows: int,
+    sheet_name: str | None,
+    ollama: OllamaConfig | None = None,
+) -> Candidate | None:
+    """Choose one table from one worksheet; never merge worksheets implicitly."""
+    if sheet_name:
+        if sheet_name not in workbook.sheetnames:
+            available = ", ".join(workbook.sheetnames)
+            raise ValueError(f"找不到工作表「{sheet_name}」。可用工作表：{available}")
+        ws = workbook[sheet_name]
+    else:
+        ws = workbook.active
+
+    if ollama and ollama.enabled:
+        try:
+            candidate = detect_candidate_with_ollama(ws, aliases, scan_rows, ollama)
+            if candidate:
+                return candidate
+        except RuntimeError as exc:
+            if not ollama.warned:
+                print(f"[WARN] {exc}；改用原本的規則判別。", file=sys.stderr)
+                ollama.warned = True
+            ollama.enabled = False
+
+    found = detect_candidates(ws, aliases, scan_rows)
+    if not found:
+        return None
+    # Prefer the row that maps the most system fields. When a table repeats the
+    # same header later in the sheet, start from the first occurrence.
+    return max(found, key=lambda item: (len(item.mapped), -item.header_row, item.score))
+
+
+def infer_source(path: Path) -> str:
+    """Infer source ID such as ad_03 from the input filename."""
+    match = re.search(r"(?i)(ad[_ -]?\d+)", path.stem)
+    return match.group(1).lower().replace("-", "_").replace(" ", "_") if match else path.stem
+
+
+def infer_context(ws: Any, candidate: Candidate) -> tuple[str | None, str | None]:
+    """Read campaign/ad-type hints located above the detected table."""
+    campaign = None
+    ad_type = None
+    for r in range(1, candidate.header_row):
+        row = [clean_text(ws.cell(r, c).value) for c in range(1, min(ws.max_column, 30) + 1)]
+        for c, text in enumerate(row):
+            low = text.lower()
+            if "客戶案名" in text or "campaign name" in low:
+                campaign = next((v for v in row[c + 1 :] if v), campaign)
+            if "廣告素材" in text and text not in {"廣告素材"}:
+                campaign = re.sub(r"^.*?廣告素材[_：: ]*", "", text).strip("_") or campaign
+    title = clean_text(ws.title)
+    if title and not re.search(r"總表|上刊畫面|summary|analysis", title, re.I):
+        ad_type = title
+    return campaign, ad_type
+
+
+# ---------------------------------------------------------------------------
+# Row cleaning and workbook output
+# ---------------------------------------------------------------------------
+
+def iter_clean_rows(ws: Any, candidate: Candidate, source: str) -> Iterable[dict[str, Any]]:
+    """Yield standardized records and discard non-data/trailing rows."""
+    campaign_hint, ad_type_hint = infer_context(ws, candidate)
+    blank_streak = 0
+    for r in range(candidate.header_row + 1, ws.max_row + 1):
+        values = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 100) + 1)]
+        if all(is_blank(v) for v in values):
+            blank_streak += 1
+            if blank_streak >= 5:
+                break
+            continue
+        blank_streak = 0
+        first_text = clean_text(next((v for v in values if not is_blank(v)), "")).lower()
+        if any(marker == first_text for marker in SUMMARY_MARKERS):
+            continue
+
+        record = {column: None for column in TARGET_COLUMNS}
+        record["source"] = source
+        record["campaign_name"] = campaign_hint
+        record["ad_type"] = ad_type_hint
+        for col, target in candidate.mapped.items():
+            value = ws.cell(r, col).value
+            record[target] = None if is_error(value) else value
+
+        if record["date"] is not None:
+            record["date"] = coerce_excel_date(record["date"])
+
+        # The impression cell is the primary evidence that this row has actual
+        # media data. Zero is kept; only blank/error impressions are discarded.
+        if is_blank(record["impressions"]) or not looks_like_data(record["impressions"]):
+            continue
+        if "date" in candidate.mapped.values() and record["date"] is None:
+            continue
+        yield record
+
+
+def format_output(ws: Any, row_count: int) -> None:
+    """Apply a small, consistent format to the cleaned output worksheet."""
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:L{max(row_count + 1, 1)}"
+    widths = [13, 14, 30, 14, 12, 20, 18, 22, 18, 18, 18, 16]
+    for idx, width in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+    for cell in ws["A"][1:]:
+        cell.number_format = "yyyy-mm-dd"
+    for col in ("F", "H"):
+        for cell in ws[col][1:]:
+            cell.number_format = "0.00%"
+    for col in ("D", "E", "G", "I", "J", "K"):
+        for cell in ws[col][1:]:
+            cell.number_format = "#,##0"
+
+
+def clean_workbook(
+    input_path: Path,
+    output_path: Path,
+    aliases: dict[str, set[str]],
+    scan_rows: int,
+    sheet_name: str | None,
+    ollama: OllamaConfig | None = None,
+) -> tuple[list[AuditRecord], int]:
+    """Clean one workbook/worksheet and save its standardized output file."""
+    wb_values = load_workbook(input_path, data_only=True, read_only=False)
+    candidate = select_candidate(wb_values, aliases, scan_rows, sheet_name, ollama)
+    audit: list[AuditRecord] = []
+    if not candidate:
+        selected_sheet = sheet_name or wb_values.active.title
+        wb_values.close()
+        audit.append(AuditRecord(str(input_path), selected_sheet, None, "找不到資料表表頭", None, 0, {}, [], None))
+        return audit, 0
+
+    output = Workbook()
+    out_ws = output.active
+    out_ws.title = "cleaned_data"
+    out_ws.append(TARGET_COLUMNS)
+    total_rows = 0
+    source = infer_source(input_path)
+    ws = wb_values[candidate.sheet]
+    rows = list(iter_clean_rows(ws, candidate, source))
+    for record in rows:
+        out_ws.append([record[column] for column in TARGET_COLUMNS])
+    total_rows = len(rows)
+    candidate.data_rows = len(rows)
+    mapped_columns = {
+        candidate.headers[col - 1]: target for col, target in candidate.mapped.items()
+    }
+    audit.append(
+        AuditRecord(
+            str(input_path), candidate.sheet, candidate.header_row, "成功" if rows else "表頭找到但沒有有效資料",
+            candidate.score, len(rows), mapped_columns, candidate.unmapped, str(output_path) if rows else None,
+        )
+    )
+    wb_values.close()
+
+    if total_rows:
+        format_output(out_ws, total_rows)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output.save(output_path)
+    output.close()
+    return audit, total_rows
+
+
+def discover_inputs(path: Path) -> list[Path]:
+    """Return one input workbook or eligible workbooks inside a folder."""
+    if path.is_file():
+        return [path]
+    return sorted(
+        p for p in path.glob("*.xlsx")
+        if not p.name.startswith("~$") and "template" not in p.stem.lower() and "cleaned" not in p.stem.lower()
+    )
+
+
+def write_audit(records: list[AuditRecord], output_dir: Path) -> None:
+    """Write detailed JSON audit data and a simple unmapped-column CSV."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "cleaning_audit.json"
+    csv_path = output_dir / "unmapped_columns.csv"
+    json_path.write_text(json.dumps([asdict(r) for r in records], ensure_ascii=False, indent=2), encoding="utf-8")
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["input_file", "sheet", "header_row", "status", "unmapped_column"])
+        for record in records:
+            if record.unmapped_columns:
+                for column in record.unmapped_columns:
+                    writer.writerow([record.input_file, record.sheet, record.header_row, record.status, column])
+            elif record.status != "成功":
+                writer.writerow([record.input_file, record.sheet, record.header_row, record.status, ""])
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Define and parse command-line options."""
+    parser = argparse.ArgumentParser(description="偵測未知 Excel 報表中的資料表並統一媒體欄位")
+    parser.add_argument("input", type=Path, help="單一 .xlsx 檔或包含 .xlsx 的資料夾")
+    parser.add_argument("-o", "--output-dir", type=Path, default=Path("cleaned_output"), help="輸出資料夾")
+    parser.add_argument(
+        "--dictionary", type=Path, default=Path("Report Template & All Format 字典.xlsx"), help="欄位字典 Excel",
+    )
+    parser.add_argument("--scan-rows", type=int, default=100, help="每張工作表最多掃描幾列尋找表頭")
+    parser.add_argument("--sheet", help="要清理的工作表名稱；未指定時使用 Excel 目前選取的工作表")
+    parser.add_argument("--ollama-model", default="qwen3.5:9b", help="本機 Ollama 模型（預設：qwen3.5:9b）")
+    parser.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="Ollama API 網址")
+    parser.add_argument("--ollama-timeout", type=float, default=120, help="等待 Ollama 回應的秒數")
+    parser.add_argument("--no-ollama", action="store_true", help="停用 Ollama，僅使用原本規則判別")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: discover inputs, clean them, and report results."""
+    args = parse_args(argv)
+    inputs = discover_inputs(args.input)
+    if not inputs:
+        print(f"找不到可處理的 .xlsx：{args.input}", file=sys.stderr)
+        return 2
+    aliases = read_dictionary(args.dictionary)
+    ollama = OllamaConfig(
+        model=args.ollama_model,
+        url=args.ollama_url,
+        timeout=args.ollama_timeout,
+        enabled=not args.no_ollama,
+    )
+    all_audit: list[AuditRecord] = []
+    succeeded = 0
+    for input_path in inputs:
+        output_path = args.output_dir / f"{input_path.stem}_cleaned.xlsx"
+        try:
+            audit, rows = clean_workbook(
+                input_path, output_path, aliases, args.scan_rows, args.sheet, ollama
+            )
+        except ValueError as exc:
+            print(f"[ERROR] {input_path.name}: {exc}", file=sys.stderr)
+            continue
+        all_audit.extend(audit)
+        if rows:
+            succeeded += 1
+            print(f"[OK] {input_path.name}: {rows} rows -> {output_path}")
+        else:
+            print(f"[WARN] {input_path.name}: 沒有輸出有效資料", file=sys.stderr)
+    write_audit(all_audit, args.output_dir)
+    print(f"完成：{succeeded}/{len(inputs)} 個檔案；稽核報告位於 {args.output_dir}")
+    return 0 if succeeded else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

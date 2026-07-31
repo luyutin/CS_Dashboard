@@ -1,0 +1,54 @@
+# Operating-system and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Build and runtime output
+build/
+dist/
+cleaned_output/
+*.log
+
+# Legacy copies and separate repositories
+Streamlit_backend/
+media-cleaner-api/
+
+# Internal/client working data
+0_其他資料/
+0_各team專案/
+Agent計畫/
+
+# Data and office documents are private by default
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.xlsm
+*.zip
+*.pkl
+*.pbix
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.ipynb
+
+# This workbook is application configuration and must be distributed
+!Report Template & All Format 字典.xlsx
