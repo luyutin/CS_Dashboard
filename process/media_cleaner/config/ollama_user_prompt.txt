@@ -1,0 +1,7 @@
+系統欄位定義：
+{target_descriptions}
+
+候選列（column 是 Excel 的 1-based 欄號；sample_rows 是其下方資料範例）：
+{options}
+
+選出一個 header_row。每個 target 最多對應一次；impressions 是有效媒體資料表的必要欄位。

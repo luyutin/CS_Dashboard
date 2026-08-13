@@ -59,16 +59,53 @@ streamlit run main.py
 
 - `main.py`: Streamlit navigation and page entry points
 - `process/`: dashboard pages and media-specific formatters
-- `clean_media_data.py`: unknown Excel detection and cleaning engine
+- `process/media_cleaner/`: unknown Excel cleaning engine and editable text configuration
 - `Report Template & All Format 字典.xlsx`: default field dictionary
 - `Photos/`: images used by the upload instructions
 
 Customer workbooks, local outputs, virtual environments, generated executables,
 and legacy project copies are intentionally excluded from Git.
 
+### Unknown-data formatter maintenance
+
+The cleaner is a package under `process/media_cleaner/`. Its Python API is in
+`engine.py`; editable output fields and Ollama prompts are under
+`process/media_cleaner/config/`. `target_columns.txt` uses one tab-delimited
+`field_key<TAB>description` per line, and its order controls output-column order.
+Restart Streamlit after changing these text files.
+
+On the Streamlit page, each uploaded workbook shows its worksheet names. Only
+the first worksheet is selected by default; users can explicitly include more.
+Selected worksheets are detected and audited independently, then merged into
+the workbook's cleaned output. For multi-sheet imports, the source value also
+contains the worksheet name so rows remain traceable.
+
+The standalone CLI is:
+
+```bash
+python -m process.media_cleaner input.xlsx --no-ollama
+```
+
+## Update an existing Windows installation
+
+For a source-code installation, close the running dashboard, open PowerShell in
+the project directory, then run:
+
+```powershell
+git pull origin main
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python run_main.py
+```
+
+If the user runs a packaged `.exe`, pulling the repository does not update that
+executable. Rebuild it on Windows from the latest `main` branch and replace the
+old distribution. The build must include both `Report Template & All Format
+字典.xlsx` and the entire `process/media_cleaner/config` directory.
+
 ## Building a Windows executable
 
 Build the executable on Windows after installing the dependencies. Ollama and the
 model remain separate prerequisites and are not embedded in the executable. Ensure
-the field dictionary and Streamlit static assets are included in the PyInstaller
-configuration.
+the field dictionary, Streamlit static assets, and the complete
+`process/media_cleaner/config` directory are included in the PyInstaller configuration.

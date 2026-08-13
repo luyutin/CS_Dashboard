@@ -1,0 +1,26 @@
+{
+  "date": ["日期", "date", "day", "走期", "reporting starts"],
+  "campaign_name": [
+    "廣告活動", "廣告活動名稱", "行銷活動名稱", "campaign", "campaign name",
+    "訂單名稱", "廣告名稱", "圖像廣告名稱", "素材名稱"
+  ],
+  "ad_name": [
+    "訂單項名稱", "廣告名稱", "圖像廣告名稱", "素材名稱", "ad name",
+    "ad creative name", "creative name", "creative"
+  ],
+  "impressions": ["曝光", "曝光數", "曝光次數", "總曝光數", "展示量", "impressions", "impr."],
+  "clicks": ["點擊", "點擊數", "點擊量", "總點擊數", "總點擊次數", "clicks", "clicks (all)"],
+  "click_through_rate": ["點擊率", "點擊率(%)", "點擊率 (%)", "點閱率", "ctr", "ctr (all)"],
+  "completed_views": [
+    "完整觀看數", "完整觀看次數", "總觀看完成數", "100%觀看", "觀看完成數",
+    "video played to 100%", "video played to 100% 的次數"
+  ],
+  "video_completion_rate": [
+    "完整觀看率", "完整觀看率(%)", "完整觀看率 (%)", "觀看完成率", "vtr",
+    "收視率", "view rate", "completion rate (video)", "3\" vtr (view through rate)"
+  ],
+  "25_percent_views": ["25%觀看", "影片播放進度：25%", "video played to 25%"],
+  "50_percent_views": ["50%觀看", "影片播放進度：50%", "video played to 50%"],
+  "75_percent_views": ["75%觀看", "影片播放進度：75%", "video played to 75%"],
+  "ad_type": ["廣告格式", "媒體 / 格式", "媒體/格式", "ad type", "format"]
+}

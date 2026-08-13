@@ -1,3 +1,4 @@
+import hashlib
 import io
 import tempfile
 import zipfile
@@ -5,13 +6,16 @@ from pathlib import Path
 
 import streamlit as st
 
-import clean_media_data
+from process import media_cleaner as clean_media_data
 
 
 def main():
     st.title('🧹 未清理資料格式化')
     st.markdown("#### **自動偵測未知 Excel 報表的表頭，並統一媒體資料欄位。**")
-    st.info('可一次上傳多個 XLSX 檔案；完成後可下載格式化檔案與稽核報告。')
+    st.info(
+        '可一次上傳多個 XLSX 檔案，並為每個檔案勾選要清整的工作表；'
+        '完成後可下載格式化檔案與稽核報告。'
+    )
 
     default_dictionary = (
         Path(__file__).resolve().parent.parent
@@ -24,6 +28,30 @@ def main():
         key="uncleaned_media_files",
     )
 
+    selected_sheets_by_file: dict[int, list[str]] = {}
+    sheet_read_errors: dict[int, str] = {}
+    if uploaded_files:
+        st.subheader("選擇要清整的工作表")
+        st.caption(
+            "每個檔案預設只勾選第一張；如果還有其他資料表，請再手動勾選。"
+            "程式會對每張工作表獨立偵測表頭與欄位。"
+        )
+        for index, uploaded_file in enumerate(uploaded_files, start=1):
+            workbook_data = uploaded_file.getvalue()
+            file_digest = hashlib.sha1(workbook_data).hexdigest()[:10]
+            try:
+                sheet_names = clean_media_data.list_workbook_sheets(workbook_data)
+            except Exception as exc:
+                sheet_read_errors[index] = str(exc)
+                st.error(f"{uploaded_file.name}：無法讀取工作表（{exc}）")
+                continue
+            selected_sheets_by_file[index] = st.multiselect(
+                f"{uploaded_file.name}（共 {len(sheet_names)} 張）",
+                options=sheet_names,
+                default=sheet_names[:1],
+                key=f"uncleaned_media_sheets_{index}_{file_digest}",
+            )
+
     with st.expander("⚙️ 進階設定"):
         scan_rows = st.number_input(
             "每張工作表最多掃描幾列尋找表頭",
@@ -32,9 +60,6 @@ def main():
             value=100,
             step=10,
         )
-        sheet_name = st.text_input(
-            "指定工作表名稱（留空時使用 Excel 目前選取的工作表）"
-        ).strip()
         dictionary_file = st.file_uploader(
             "自訂欄位字典（選填，XLSX）",
             type=["xlsx"],
@@ -80,6 +105,21 @@ def main():
     if st.button("開始格式化", type="primary", key="clean_uncleaned_media"):
         if not uploaded_files:
             st.error("請先上傳至少一個 XLSX 檔案。")
+        elif sheet_read_errors:
+            st.error("有檔案無法讀取工作表，請確認檔案內容後再試。")
+        elif any(
+            not selected_sheets_by_file.get(index)
+            for index in range(1, len(uploaded_files) + 1)
+        ):
+            missing_files = [
+                uploaded_file.name
+                for index, uploaded_file in enumerate(uploaded_files, start=1)
+                if not selected_sheets_by_file.get(index)
+            ]
+            st.error(
+                "請為以下檔案至少勾選一張工作表："
+                + "、".join(missing_files)
+            )
         else:
             st.session_state.pop("uncleaned_media_results", None)
             with st.spinner("正在偵測表頭並格式化資料，請稍候…"):
@@ -127,19 +167,19 @@ def main():
                         output_path = output_dir / output_name
 
                         try:
-                            audit, rows = clean_media_data.clean_workbook(
+                            audit, rows = clean_media_data.clean_workbook_sheets(
                                 input_path=input_path,
                                 output_path=output_path,
                                 aliases=aliases,
                                 scan_rows=int(scan_rows),
-                                sheet_name=sheet_name or None,
+                                sheet_names=selected_sheets_by_file[index],
                                 ollama=ollama,
                             )
                         except Exception as exc:
                             audit = [
                                 clean_media_data.AuditRecord(
                                     input_file=safe_name,
-                                    sheet=sheet_name,
+                                    sheet="、".join(selected_sheets_by_file[index]),
                                     header_row=None,
                                     status=f"處理失敗：{exc}",
                                     score=None,
@@ -153,7 +193,9 @@ def main():
 
                         for record in audit:
                             record.input_file = safe_name
-                            record.output_file = output_name if rows else None
+                            record.output_file = (
+                                output_name if record.data_rows else None
+                            )
                         all_audit.extend(audit)
                         if rows and output_path.exists():
                             cleaned_files.append(
@@ -227,7 +269,9 @@ def main():
 
     for record in results["audit"]:
         if record["欄位對應"]:
-            with st.expander(f"欄位對應：{record['檔案']}"):
+            with st.expander(
+                f"欄位對應：{record['檔案']} / {record['工作表']}"
+            ):
                 st.json(record["欄位對應"])
 
     st.subheader("下載")

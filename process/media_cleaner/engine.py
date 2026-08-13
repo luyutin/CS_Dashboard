@@ -6,14 +6,15 @@ validates the rows below it, then exports the detected table using the system
 schema. If Ollama is unavailable, the original deterministic rules are used.
 
 Examples:
-    python clean_media_data.py input.xlsx
-    python clean_media_data.py "0_其他資料/Raw Data_for Louis" -o cleaned_output
+    python -m process.media_cleaner input.xlsx
+    python -m process.media_cleaner "0_其他資料/Raw Data_for Louis" -o cleaned_output
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
 import re
@@ -25,6 +26,14 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from .settings import (
+    ALIASES,
+    OLLAMA_SYSTEM_PROMPT,
+    TARGET_COLUMNS,
+    TARGET_DESCRIPTIONS,
+    render_ollama_user_prompt,
+)
+
 try:
     from openpyxl import Workbook, load_workbook
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -33,71 +42,10 @@ except ImportError as exc:  # pragma: no cover - gives a useful CLI error
     raise SystemExit("缺少 openpyxl；請先執行：pip install openpyxl") from exc
 
 
-TARGET_COLUMNS = [
-    "date",
-    "source",
-    "campaign_name",
-    "impressions",
-    "clicks",
-    "click_through_rate",
-    "completed_views",
-    "video_completion_rate",
-    "25_percent_views",
-    "50_percent_views",
-    "75_percent_views",
-    "ad_type",
-]
-
-# Explicit aliases cover the local-media samples. The report dictionary is also
-# loaded at runtime, so its Chinese/English canonical names remain the authority.
-ALIASES: dict[str, tuple[str, ...]] = {
-    "date": ("日期", "date", "day", "走期", "reporting starts"),
-    "campaign_name": (
-        "廣告活動", "廣告活動名稱", "行銷活動名稱", "campaign", "campaign name",
-        "訂單名稱", "訂單項名稱", "廣告名稱", "圖像廣告名稱", "素材名稱",
-    ),
-    "impressions": (
-        "曝光", "曝光數", "曝光次數", "總曝光數", "展示量", "impressions", "impr.",
-    ),
-    "clicks": (
-        "點擊", "點擊數", "點擊量", "總點擊數", "總點擊次數", "clicks", "clicks (all)",
-    ),
-    "click_through_rate": (
-        "點擊率", "點擊率(%)", "點擊率 (%)", "點閱率", "ctr", "ctr (all)",
-    ),
-    "completed_views": (
-        "完整觀看數", "完整觀看次數", "總觀看完成數", "100%觀看", "觀看完成數",
-        "video played to 100%", "video played to 100% 的次數",
-    ),
-    "video_completion_rate": (
-        "完整觀看率", "完整觀看率(%)", "完整觀看率 (%)", "觀看完成率", "vtr",
-        "收視率", "view rate", "completion rate (video)", "3\" vtr (view through rate)",
-    ),
-    "25_percent_views": ("25%觀看", "影片播放進度：25%", "video played to 25%"),
-    "50_percent_views": ("50%觀看", "影片播放進度：50%", "video played to 50%"),
-    "75_percent_views": ("75%觀看", "影片播放進度：75%", "video played to 75%"),
-    "ad_type": ("廣告格式", "媒體 / 格式", "媒體/格式", "ad type", "format"),
-}
-
 IMPRESSION_MARKERS = ("曝光", "展示量", "impression", "impr.")
 DATE_MARKERS = ("日期", "date", "day", "走期", "reporting starts")
 SUMMARY_MARKERS = ("合計", "總計", "total", "subtotal")
 PREFERRED_SHEETS = ("daily", "每日", "by day", "byday")
-
-TARGET_DESCRIPTIONS = {
-    "date": "報表日期、投放日期或 reporting date",
-    "campaign_name": "廣告活動、訂單、素材或 campaign 名稱",
-    "impressions": "曝光數、展示次數或 impressions",
-    "clicks": "點擊數或 clicks",
-    "click_through_rate": "點擊率、CTR（百分比）",
-    "completed_views": "僅限影片完整或播放至 100% 的次數；一般 video views 不屬於此欄",
-    "video_completion_rate": "影片完整觀看率、VTR、view/completion rate（必須是百分比率）",
-    "25_percent_views": "僅限明確寫出影片播放至 25% 的次數",
-    "50_percent_views": "僅限明確寫出影片播放至 50% 的次數",
-    "75_percent_views": "僅限明確寫出影片播放至 75% 的次數",
-    "ad_type": "廣告格式、媒體格式或 ad type；頻率、觸及人數不是廣告格式",
-}
-
 
 # ---------------------------------------------------------------------------
 # Internal data structures
@@ -232,6 +180,7 @@ def read_dictionary(path: Path | None) -> dict[str, set[str]]:
     canonical_to_target = {
         "Date": "date",
         "Campaign name": "campaign_name",
+        "AD name": "ad_name",
         "Impressions": "impressions",
         "Clicks (all)": "clicks",
         "CTR (All)": "click_through_rate",
@@ -368,12 +317,7 @@ def call_ollama_json(prompt: str, config: OllamaConfig) -> dict[str, Any]:
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "你是媒體報表資料工程師。只根據提供的 Excel 候選列，找出真正的資料表表頭，"
-                    "並把欄位對應到指定系統欄位。不要猜測不存在的欄位。若沒有可信表頭，"
-                    "header_row 回傳 0、mappings 回傳空陣列。不要為了填滿欄位而強迫配對；"
-                    "觸及、不重複使用者、頻率、花費及一般影片觀看數等未列出的指標應保持未對應。"
-                ),
+                "content": OLLAMA_SYSTEM_PROMPT,
             },
             {"role": "user", "content": prompt},
         ],
@@ -432,12 +376,9 @@ def detect_candidate_with_ollama(
     options = header_options_for_ollama(ws, scan_rows)
     if not options:
         return None
-    prompt = (
-        "系統欄位定義：\n"
-        f"{json.dumps(TARGET_DESCRIPTIONS, ensure_ascii=False, indent=2)}\n\n"
-        "候選列（column 是 Excel 的 1-based 欄號；sample_rows 是其下方資料範例）：\n"
-        f"{json.dumps(options, ensure_ascii=False)}\n\n"
-        "選出一個 header_row。每個 target 最多對應一次；impressions 是有效媒體資料表的必要欄位。"
+    prompt = render_ollama_user_prompt(
+        target_descriptions=json.dumps(TARGET_DESCRIPTIONS, ensure_ascii=False, indent=2),
+        options=json.dumps(options, ensure_ascii=False),
     )
     result = call_ollama_json(prompt, config)
     try:
@@ -707,18 +648,171 @@ def format_output(ws: Any, row_count: int) -> None:
         cell.font = Font(color="FFFFFF", bold=True)
         cell.alignment = Alignment(horizontal="center")
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:L{max(row_count + 1, 1)}"
-    widths = [13, 14, 30, 14, 12, 20, 18, 22, 18, 18, 18, 16]
-    for idx, width in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(idx)].width = width
-    for cell in ws["A"][1:]:
+    last_column = get_column_letter(len(TARGET_COLUMNS))
+    ws.auto_filter.ref = f"A1:{last_column}{max(row_count + 1, 1)}"
+
+    widths = {
+        "date": 13,
+        "source": 14,
+        "campaign_name": 30,
+        "ad_name": 30,
+        "impressions": 14,
+        "clicks": 12,
+        "click_through_rate": 20,
+        "completed_views": 18,
+        "video_completion_rate": 22,
+        "25_percent_views": 18,
+        "50_percent_views": 18,
+        "75_percent_views": 18,
+        "ad_type": 16,
+    }
+    column_letters = {
+        target: get_column_letter(index)
+        for index, target in enumerate(TARGET_COLUMNS, start=1)
+    }
+    for target, width in widths.items():
+        ws.column_dimensions[column_letters[target]].width = width
+
+    for cell in ws[column_letters["date"]][1:]:
         cell.number_format = "yyyy-mm-dd"
-    for col in ("F", "H"):
-        for cell in ws[col][1:]:
+    for target in ("click_through_rate", "video_completion_rate"):
+        for cell in ws[column_letters[target]][1:]:
             cell.number_format = "0.00%"
-    for col in ("D", "E", "G", "I", "J", "K"):
-        for cell in ws[col][1:]:
+    for target in (
+        "impressions",
+        "clicks",
+        "completed_views",
+        "25_percent_views",
+        "50_percent_views",
+        "75_percent_views",
+    ):
+        for cell in ws[column_letters[target]][1:]:
             cell.number_format = "#,##0"
+
+
+def list_workbook_sheets(workbook_data: bytes) -> list[str]:
+    """Return worksheet names in workbook order without changing the file."""
+    workbook = load_workbook(io.BytesIO(workbook_data), data_only=True, read_only=True)
+    try:
+        return list(workbook.sheetnames)
+    finally:
+        workbook.close()
+
+
+def clean_workbook_sheets(
+    input_path: Path,
+    output_path: Path,
+    aliases: dict[str, set[str]],
+    scan_rows: int,
+    sheet_names: Iterable[str],
+    ollama: OllamaConfig | None = None,
+) -> tuple[list[AuditRecord], int]:
+    """Clean explicitly selected worksheets into one standardized output table.
+
+    Each worksheet is detected and audited independently. When more than one
+    worksheet is selected, its name is appended to ``source`` so merged rows
+    remain traceable to the originating worksheet.
+    """
+    selected_sheets = list(dict.fromkeys(name for name in sheet_names if name))
+    if not selected_sheets:
+        raise ValueError("請至少選擇一個工作表。")
+
+    wb_values = load_workbook(input_path, data_only=True, read_only=False)
+    missing_sheets = [
+        sheet_name
+        for sheet_name in selected_sheets
+        if sheet_name not in wb_values.sheetnames
+    ]
+    if missing_sheets:
+        available = "、".join(wb_values.sheetnames)
+        wb_values.close()
+        missing = "、".join(missing_sheets)
+        raise ValueError(f"找不到工作表「{missing}」。可用工作表：{available}")
+
+    output = Workbook()
+    out_ws = output.active
+    out_ws.title = "cleaned_data"
+    out_ws.append(TARGET_COLUMNS)
+    audit: list[AuditRecord] = []
+    total_rows = 0
+    source = infer_source(input_path)
+    include_sheet_in_source = len(selected_sheets) > 1
+
+    try:
+        for sheet_name in selected_sheets:
+            try:
+                candidate = select_candidate(
+                    wb_values,
+                    aliases,
+                    scan_rows,
+                    sheet_name,
+                    ollama,
+                )
+                if not candidate:
+                    audit.append(
+                        AuditRecord(
+                            str(input_path),
+                            sheet_name,
+                            None,
+                            "找不到資料表表頭",
+                            None,
+                            0,
+                            {},
+                            [],
+                            None,
+                        )
+                    )
+                    continue
+
+                row_source = (
+                    f"{source} [{sheet_name}]" if include_sheet_in_source else source
+                )
+                ws = wb_values[candidate.sheet]
+                rows = list(iter_clean_rows(ws, candidate, row_source))
+                for record in rows:
+                    out_ws.append([record[column] for column in TARGET_COLUMNS])
+                total_rows += len(rows)
+                candidate.data_rows = len(rows)
+                mapped_columns = {
+                    candidate.headers[col - 1]: target
+                    for col, target in candidate.mapped.items()
+                }
+                audit.append(
+                    AuditRecord(
+                        str(input_path),
+                        candidate.sheet,
+                        candidate.header_row,
+                        "成功" if rows else "表頭找到但沒有有效資料",
+                        candidate.score,
+                        len(rows),
+                        mapped_columns,
+                        candidate.unmapped,
+                        str(output_path) if rows else None,
+                    )
+                )
+            except Exception as exc:
+                audit.append(
+                    AuditRecord(
+                        str(input_path),
+                        sheet_name,
+                        None,
+                        f"處理失敗：{exc}",
+                        None,
+                        0,
+                        {},
+                        [],
+                        None,
+                    )
+                )
+    finally:
+        wb_values.close()
+
+    if total_rows:
+        format_output(out_ws, total_rows)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output.save(output_path)
+    output.close()
+    return audit, total_rows
 
 
 def clean_workbook(
@@ -730,44 +824,21 @@ def clean_workbook(
     ollama: OllamaConfig | None = None,
 ) -> tuple[list[AuditRecord], int]:
     """Clean one workbook/worksheet and save its standardized output file."""
-    wb_values = load_workbook(input_path, data_only=True, read_only=False)
-    candidate = select_candidate(wb_values, aliases, scan_rows, sheet_name, ollama)
-    audit: list[AuditRecord] = []
-    if not candidate:
-        selected_sheet = sheet_name or wb_values.active.title
-        wb_values.close()
-        audit.append(AuditRecord(str(input_path), selected_sheet, None, "找不到資料表表頭", None, 0, {}, [], None))
-        return audit, 0
-
-    output = Workbook()
-    out_ws = output.active
-    out_ws.title = "cleaned_data"
-    out_ws.append(TARGET_COLUMNS)
-    total_rows = 0
-    source = infer_source(input_path)
-    ws = wb_values[candidate.sheet]
-    rows = list(iter_clean_rows(ws, candidate, source))
-    for record in rows:
-        out_ws.append([record[column] for column in TARGET_COLUMNS])
-    total_rows = len(rows)
-    candidate.data_rows = len(rows)
-    mapped_columns = {
-        candidate.headers[col - 1]: target for col, target in candidate.mapped.items()
-    }
-    audit.append(
-        AuditRecord(
-            str(input_path), candidate.sheet, candidate.header_row, "成功" if rows else "表頭找到但沒有有效資料",
-            candidate.score, len(rows), mapped_columns, candidate.unmapped, str(output_path) if rows else None,
-        )
+    selected_sheet = sheet_name
+    if not selected_sheet:
+        workbook = load_workbook(input_path, data_only=True, read_only=True)
+        try:
+            selected_sheet = workbook.active.title
+        finally:
+            workbook.close()
+    return clean_workbook_sheets(
+        input_path=input_path,
+        output_path=output_path,
+        aliases=aliases,
+        scan_rows=scan_rows,
+        sheet_names=[selected_sheet],
+        ollama=ollama,
     )
-    wb_values.close()
-
-    if total_rows:
-        format_output(out_ws, total_rows)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output.save(output_path)
-    output.close()
-    return audit, total_rows
 
 
 def discover_inputs(path: Path) -> list[Path]:

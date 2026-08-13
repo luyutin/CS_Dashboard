@@ -1,0 +1,15 @@
+# 欄位 key<TAB>提供給 Ollama 的欄位定義
+# 順序就是 cleaned_data 工作表的輸出欄位順序；修改後請重啟程式。
+date	報表日期、投放日期或 reporting date
+source	來源檔案或資料來源識別
+campaign_name	廣告活動、訂單名稱、素材或 campaign 名稱
+ad_name	廣告、素材、訂單項目或 ad name
+impressions	曝光數、展示次數或 impressions
+clicks	點擊數或 clicks
+click_through_rate	點擊率、CTR（百分比）
+completed_views	僅限影片完整或播放至 100% 的次數；一般 video views 不屬於此欄
+video_completion_rate	影片完整觀看率、VTR、view/completion rate（必須是百分比率）
+25_percent_views	僅限明確寫出影片播放至 25% 的次數
+50_percent_views	僅限明確寫出影片播放至 50% 的次數
+75_percent_views	僅限明確寫出影片播放至 75% 的次數
+ad_type	廣告格式、媒體格式或 ad type；頻率、觸及人數不是廣告格式
