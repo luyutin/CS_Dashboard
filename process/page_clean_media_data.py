@@ -11,10 +11,10 @@ from process import media_cleaner as clean_media_data
 
 def main():
     st.title('🧹 未清理資料格式化')
-    st.markdown("#### **自動偵測未知 Excel 報表的表頭，並統一媒體資料欄位。**")
+    st.markdown("#### **自動偵測未知 Excel 報表的表頭，並對應到系統標準欄位。**")
     st.info(
         '可一次上傳多個 XLSX 檔案，並為每個檔案勾選要清整的工作表；'
-        '完成後可下載格式化檔案與稽核報告。'
+        '完成後可下載格式化檔案與稽核報告；整欄無值的標準欄位不會輸出。'
     )
 
     default_dictionary = (
@@ -221,8 +221,22 @@ def main():
                         archive.writestr("cleaning_audit.json", audit_json)
                         archive.writestr("unmapped_columns.csv", unmapped_csv)
 
+                    consolidated_path = temp_root / "cleaned_media_results.xlsx"
+                    consolidated_rows = (
+                        clean_media_data.consolidate_cleaned_workbooks(
+                            cleaned_paths=[
+                                output_dir / cleaned_file["name"]
+                                for cleaned_file in cleaned_files
+                            ],
+                            records=all_audit,
+                            output_path=consolidated_path,
+                        )
+                    )
+
                     st.session_state.uncleaned_media_results = {
                         "files": cleaned_files,
+                        "consolidated": consolidated_path.read_bytes(),
+                        "consolidated_rows": consolidated_rows,
                         "audit": [
                             {
                                 "檔案": record.input_file,
@@ -275,37 +289,49 @@ def main():
                 st.json(record["欄位對應"])
 
     st.subheader("下載")
-    if results["files"]:
+    with st.expander("📦 輸出檔案", expanded=False):
         st.download_button(
-            "📦 下載全部結果（ZIP）",
-            data=results["zip"],
-            file_name="cleaned_media_results.zip",
-            mime="application/zip",
-            key="download_all_cleaned_media",
+            f"下載匯總結果（Excel，共 {results['consolidated_rows']:,} 列）",
+            data=results["consolidated"],
+            file_name="cleaned_media_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_consolidated_cleaned_media",
+            type="primary",
         )
-        for index, cleaned_file in enumerate(results["files"], start=1):
+        st.caption(
+            "內含 cleaned_data、cleaning_audit、unmapped_columns 三張工作表。"
+        )
+        if results["files"]:
             st.download_button(
-                f"下載 {cleaned_file['name']}（{cleaned_file['rows']} 列）",
-                data=cleaned_file["data"],
-                file_name=cleaned_file["name"],
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"download_cleaned_media_{index}",
+                "下載全部結果（ZIP）",
+                data=results["zip"],
+                file_name="cleaned_media_results.zip",
+                mime="application/zip",
+                key="download_all_cleaned_media",
             )
+            for index, cleaned_file in enumerate(results["files"], start=1):
+                st.download_button(
+                    f"下載 {cleaned_file['name']}（{cleaned_file['rows']} 列）",
+                    data=cleaned_file["data"],
+                    file_name=cleaned_file["name"],
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"download_cleaned_media_{index}",
+                )
 
-    audit_col, unmapped_col = st.columns(2)
-    with audit_col:
-        st.download_button(
-            "下載完整稽核報告（JSON）",
-            data=results["audit_json"],
-            file_name="cleaning_audit.json",
-            mime="application/json",
-            key="download_cleaning_audit",
-        )
-    with unmapped_col:
-        st.download_button(
-            "下載未對應欄位（CSV）",
-            data=results["unmapped_csv"],
-            file_name="unmapped_columns.csv",
-            mime="text/csv",
-            key="download_unmapped_columns",
-        )
+        audit_col, unmapped_col = st.columns(2)
+        with audit_col:
+            st.download_button(
+                "下載完整稽核報告（JSON）",
+                data=results["audit_json"],
+                file_name="cleaning_audit.json",
+                mime="application/json",
+                key="download_cleaning_audit",
+            )
+        with unmapped_col:
+            st.download_button(
+                "下載未對應欄位（CSV）",
+                data=results["unmapped_csv"],
+                file_name="unmapped_columns.csv",
+                mime="text/csv",
+                key="download_unmapped_columns",
+            )

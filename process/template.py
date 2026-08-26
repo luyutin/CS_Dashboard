@@ -1,4 +1,5 @@
 import pandas as pd
+from process.template_schema import TEMPLATE_COLUMNS
 from process.SC_Abbot import sc_abbot_sem, sc_abbot_ga
 from process.SC_PG import sc_pg_meta, sc_pg_line, sc_pg_DV3_iMedia, sc_pg_DV3_YTVideo, sc_pg_DV3_OEVideo, sc_pg_TTD_iMedia, sc_pg_TTD_OEVideo, sc_pg_kol
 from process.SC_Samsung import sc_samsung_pmax , sc_samsung_meta, sc_samsung_google, sc_samsung_line, sc_samsung_ttd, sc_samsung_GA
@@ -12,23 +13,7 @@ from process.ZO_Nespresso import zo_nespresso_TTD, zo_nespresso_meta, zo_nespres
 
 
 def template():
-    columns = ['Region', 'Market', 'BU', 'Customer', 'Date', 'Duration',
-               'Media', 'Platform', 'Advertiser Currency', 'Final URL', 'Item (Summary of filter)',
-               'Account name', 'Campaign name', 'Campaign Objective', 'Campaign Free Form', 'Adset name',  'Audience', 'Adset Free Form',
-               'Message Type', 'Ad Free Form', 'Adset MD', 'Product',
-               'Channel', 'InName Site', 'Campaign Type', 'Buying Type','Placement', 'SEM Status',
-               'Reach', 'Impressions', 'Clicks (all)', 'Frequency', 'Link clicks (Web Clicks)', 'Spent (TWD)',
-               'Purchases conversion value', 'Conversions', 'Conversion Value', 'MV>5',
-               'Views', '3" Video Views', '15" Video Views (ThruPlays)', 'TrueView: Views',
-               'Video played to 25%', 'Video played to 50%', 'Video played to 75%', 'Video played to 100%',
-               'Fan page like', 'Page Likes or followers',
-               'Post comments', 'Post engagements', 'Post reactions', 'Post shares', 'Photo Views', 'Post Saves',
-               'Adds to cart', 'Purchases', 'Revenue', 'Sales Engagement', 'Purchase ROAS', 'Quality Score',
-               'Leads', 'Actions', 'View-through conversion', 'Clicks conversion', 'View conversion',
-               'User number', 'Total PPL', 'New user', 'Working session', 'Bounce Rate',
-               'Avg engagement time per session', 'Avg Working session time', 'GA Session name', 'GA Session Type', 'GA Session Qty',
-               'TVR', '10 Second TVR', 'Reach 000s']
-    return pd.DataFrame(columns=columns)
+    return pd.DataFrame(columns=TEMPLATE_COLUMNS)
 
 def process_map():
     relation_map = {

@@ -42,8 +42,6 @@ except ImportError as exc:  # pragma: no cover - gives a useful CLI error
     raise SystemExit("缺少 openpyxl；請先執行：pip install openpyxl") from exc
 
 
-IMPRESSION_MARKERS = ("曝光", "展示量", "impression", "impr.")
-DATE_MARKERS = ("日期", "date", "day", "走期", "reporting starts")
 SUMMARY_MARKERS = ("合計", "總計", "total", "subtotal")
 PREFERRED_SHEETS = ("daily", "每日", "by day", "byday")
 
@@ -111,7 +109,11 @@ def normalize(value: Any) -> str:
 
 def is_blank(value: Any) -> bool:
     """Treat None, empty strings and vendor dash placeholders as blank."""
-    return value is None or clean_text(value) in {"", "--", "—"}
+    return (
+        value is None
+        or (isinstance(value, float) and math.isnan(value))
+        or clean_text(value) in {"", "--", "—"}
+    )
 
 
 def is_error(value: Any) -> bool:
@@ -177,30 +179,32 @@ def read_dictionary(path: Path | None) -> dict[str, set[str]]:
 
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb["字典欄位說明"] if "字典欄位說明" in wb.sheetnames else wb.worksheets[0]
-    canonical_to_target = {
-        "Date": "date",
-        "Campaign name": "campaign_name",
-        "AD name": "ad_name",
-        "Impressions": "impressions",
-        "Clicks (all)": "clicks",
-        "CTR (All)": "click_through_rate",
-        "Video played to 100%": "completed_views",
-        "Completion Rate (Video)": "video_completion_rate",
-        "View rate": "video_completion_rate",
-        '3" VTR (View Through Rate)': "video_completion_rate",
-        "Video played to 25%": "25_percent_views",
-        "Video played to 50%": "50_percent_views",
-        "Video played to 75%": "75_percent_views",
-        "Campaign Type": "ad_type",
+    canonical_to_target = {normalize(target): target for target in TARGET_COLUMNS}
+    ignored_dictionary_values = {
+        "na",
+        "∅",
+        "檔名",
+        "品牌自填",
+        "檔名[0]",
+        "檔名[2]",
+        "檔名[3]",
     }
     for row in ws.iter_rows(min_row=3, values_only=True):
         zh, en = row[1] if len(row) > 1 else None, row[2] if len(row) > 2 else None
-        target = canonical_to_target.get(clean_text(en))
+        target = canonical_to_target.get(normalize(en))
         if not target:
             continue
         for value in (zh, en, *(row[7:12] if len(row) >= 12 else [])):
-            if value and clean_text(value) not in {"∅", "NA"}:
-                aliases[target].add(normalize(value))
+            alias = normalize(value)
+            if not alias or alias in ignored_dictionary_values:
+                continue
+            claimed_elsewhere = any(
+                alias in target_aliases
+                for other_target, target_aliases in aliases.items()
+                if other_target != target
+            )
+            if not claimed_elsewhere:
+                aliases[target].add(alias)
     wb.close()
     return aliases
 
@@ -220,12 +224,6 @@ def match_header(header: Any, aliases: dict[str, set[str]]) -> str | None:
             if len(alias) >= 4 and (alias in key or key in alias):
                 matches.append((len(alias), target))
     return max(matches)[1] if matches else None
-
-
-def has_marker(values: Iterable[Any], markers: tuple[str, ...]) -> bool:
-    """Check whether a row contains at least one required keyword."""
-    joined = " | ".join(clean_text(v).lower() for v in values)
-    return any(marker.lower() in joined for marker in markers)
 
 
 # ---------------------------------------------------------------------------
@@ -253,14 +251,13 @@ def header_options_for_ollama(ws: Any, scan_rows: int) -> list[dict[str, Any]]:
     for row_idx in range(1, max_row + 1):
         values = [ws.cell(row_idx, col).value for col in range(1, max_col + 1)]
         nonblank = [(col, value) for col, value in enumerate(values, 1) if not is_blank(value)]
-        if len(nonblank) < 3:
+        if len(nonblank) < 2:
             continue
         text_count = sum(isinstance(value, str) and not is_error(value) for _, value in nonblank)
         if text_count < 2:
             continue
         known_count = sum(match_header(value, base_aliases) is not None for _, value in nonblank)
-        marker_bonus = 20 if has_marker((value for _, value in nonblank), IMPRESSION_MARKERS) else 0
-        score = marker_bonus + known_count * 5 + text_count / len(nonblank) * 5 + min(len(nonblank), 20) / 10
+        score = known_count * 8 + text_count / len(nonblank) * 5 + min(len(nonblank), 20) / 10
         ranked.append((score, row_idx, values))
 
     # Limit prompt size while retaining the strongest structurally plausible rows.
@@ -349,21 +346,22 @@ def call_ollama_json(prompt: str, config: OllamaConfig) -> dict[str, Any]:
 def llm_mapping_is_plausible(header: Any, target: str) -> bool:
     """Reject common LLM metric confusions even when confidence is overstated."""
     text = clean_text(header).lower()
-    if target == "click_through_rate":
-        return any(marker in text for marker in ("ctr", "click through", "點擊率", "點閱率"))
-    if target == "completed_views":
-        return any(marker in text for marker in ("100", "complete", "完整", "完成"))
-    if target == "video_completion_rate":
-        return any(marker in text for marker in ("rate", "率", "vtr"))
-    if target == "25_percent_views":
+    if target == "Video played to 25%":
         return "25" in text
-    if target == "50_percent_views":
+    if target == "Video played to 50%":
         return "50" in text
-    if target == "75_percent_views":
+    if target == "Video played to 75%":
         return "75" in text
-    if target == "ad_type":
+    if target == "Video played to 100%":
+        return any(marker in text for marker in ("100", "complete", "完整", "完成"))
+    if target == "Campaign Type":
         return any(marker in text for marker in ("type", "format", "格式", "類型", "媒體 /", "媒體/"))
     return True
+
+
+def mapping_is_sufficient(mapped: dict[int, str]) -> bool:
+    """Require enough independent evidence to identify a real data table."""
+    return len(set(mapped.values())) >= 2
 
 
 def detect_candidate_with_ollama(
@@ -429,7 +427,7 @@ def detect_candidate_with_ollama(
             mapped[col] = target
             used_targets.add(target)
 
-    if "impressions" not in used_targets:
+    if not mapping_is_sufficient(mapped):
         return None
 
     checked = 0
@@ -472,19 +470,17 @@ def detect_candidate_with_ollama(
 def detect_candidates(ws: Any, aliases: dict[str, set[str]], scan_rows: int) -> list[Candidate]:
     """Find and score plausible header rows within one worksheet.
 
-    A row is not accepted merely because it contains the word "曝光". It must
-    also contain several non-empty headers and be followed by data-like rows.
+    A row must contain at least two independently mapped template fields and be
+    followed by data-like rows. No single metric (such as Impressions) is
+    required, so GA, TV, conversion-only and other valid reports are accepted.
     """
     candidates: list[Candidate] = []
     max_row = min(ws.max_row, scan_rows)
     max_col = min(ws.max_column, 100)
     for row_idx in range(1, max_row + 1):
         raw_headers = [ws.cell(row_idx, col).value for col in range(1, max_col + 1)]
-        if not has_marker(raw_headers, IMPRESSION_MARKERS):
-            continue
-
         nonblank = [v for v in raw_headers if not is_blank(v)]
-        if len(nonblank) < 3:
+        if len(nonblank) < 2:
             continue
 
         mapped: dict[int, str] = {}
@@ -500,6 +496,9 @@ def detect_candidates(ws: Any, aliases: dict[str, set[str]], scan_rows: int) -> 
             elif not target:
                 unmapped.append(clean_text(value))
 
+        if not mapping_is_sufficient(mapped):
+            continue
+
         # Validate the next few rows. This rejects report titles such as
         # "保證曝光數 / 曝光達成率", which contain the keyword but are not tables.
         checked = 0
@@ -513,15 +512,15 @@ def detect_candidates(ws: Any, aliases: dict[str, set[str]], scan_rows: int) -> 
             checked += 1
             if sum(looks_like_data(v) for v in filled) >= max(2, math.ceil(len(filled) * 0.5)):
                 data_like += 1
-            date_col = next((c for c, t in mapped.items() if t == "date"), None)
+            date_col = next((c for c, t in mapped.items() if t == "Date"), None)
             if date_col and looks_like_date(ws.cell(r, date_col).value):
                 date_like += 1
 
-        if checked == 0 or data_like / checked < 0.6 or "impressions" not in used_targets:
+        if checked == 0 or data_like / checked < 0.6:
             continue
 
         score = len(mapped) * 10 + (data_like / checked) * 10
-        if "date" in used_targets:
+        if "Date" in used_targets:
             score += 25 + min(date_like, 5) * 2
         if any(marker in ws.title.lower() for marker in PREFERRED_SHEETS):
             score += 30
@@ -576,16 +575,9 @@ def select_candidate(
     return max(found, key=lambda item: (len(item.mapped), -item.header_row, item.score))
 
 
-def infer_source(path: Path) -> str:
-    """Infer source ID such as ad_03 from the input filename."""
-    match = re.search(r"(?i)(ad[_ -]?\d+)", path.stem)
-    return match.group(1).lower().replace("-", "_").replace(" ", "_") if match else path.stem
-
-
 def infer_context(ws: Any, candidate: Candidate) -> tuple[str | None, str | None]:
-    """Read campaign/ad-type hints located above the detected table."""
+    """Read a campaign hint explicitly labelled above the detected table."""
     campaign = None
-    ad_type = None
     for r in range(1, candidate.header_row):
         row = [clean_text(ws.cell(r, c).value) for c in range(1, min(ws.max_column, 30) + 1)]
         for c, text in enumerate(row):
@@ -594,17 +586,14 @@ def infer_context(ws: Any, candidate: Candidate) -> tuple[str | None, str | None
                 campaign = next((v for v in row[c + 1 :] if v), campaign)
             if "廣告素材" in text and text not in {"廣告素材"}:
                 campaign = re.sub(r"^.*?廣告素材[_：: ]*", "", text).strip("_") or campaign
-    title = clean_text(ws.title)
-    if title and not re.search(r"總表|上刊畫面|summary|analysis", title, re.I):
-        ad_type = title
-    return campaign, ad_type
+    return campaign, None
 
 
 # ---------------------------------------------------------------------------
 # Row cleaning and workbook output
 # ---------------------------------------------------------------------------
 
-def iter_clean_rows(ws: Any, candidate: Candidate, source: str) -> Iterable[dict[str, Any]]:
+def iter_clean_rows(ws: Any, candidate: Candidate) -> Iterable[dict[str, Any]]:
     """Yield standardized records and discard non-data/trailing rows."""
     campaign_hint, ad_type_hint = infer_context(ws, candidate)
     blank_streak = 0
@@ -621,73 +610,260 @@ def iter_clean_rows(ws: Any, candidate: Candidate, source: str) -> Iterable[dict
             continue
 
         record = {column: None for column in TARGET_COLUMNS}
-        record["source"] = source
-        record["campaign_name"] = campaign_hint
-        record["ad_type"] = ad_type_hint
+        record["Campaign name"] = campaign_hint
+        record["Campaign Type"] = ad_type_hint
         for col, target in candidate.mapped.items():
             value = ws.cell(r, col).value
-            record[target] = None if is_error(value) else value
+            record[target] = None if is_error(value) or is_blank(value) else value
 
-        if record["date"] is not None:
-            record["date"] = coerce_excel_date(record["date"])
+        if record["Date"] is not None:
+            record["Date"] = coerce_excel_date(record["Date"])
 
-        # The impression cell is the primary evidence that this row has actual
-        # media data. Zero is kept; only blank/error impressions are discarded.
-        if is_blank(record["impressions"]) or not looks_like_data(record["impressions"]):
+        mapped_values = [record[target] for target in candidate.mapped.values()]
+        if not any(not is_blank(value) and looks_like_data(value) for value in mapped_values):
             continue
-        if "date" in candidate.mapped.values() and record["date"] is None:
+        if "Date" in candidate.mapped.values() and record["Date"] is None:
             continue
         yield record
 
 
-def format_output(ws: Any, row_count: int) -> None:
+def populated_columns(records: Iterable[dict[str, Any]]) -> list[str]:
+    """Return non-empty output columns in canonical template order."""
+    rows = list(records)
+    return [
+        column
+        for column in TARGET_COLUMNS
+        if any(not is_blank(record.get(column)) for record in rows)
+    ]
+
+
+def format_output(
+    ws: Any,
+    row_count: int,
+    output_columns: Iterable[str] | None = None,
+) -> None:
     """Apply a small, consistent format to the cleaned output worksheet."""
+    columns = list(output_columns or (cell.value for cell in ws[1] if cell.value))
+    if not columns:
+        return
     header_fill = PatternFill("solid", fgColor="1F4E78")
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = Font(color="FFFFFF", bold=True)
         cell.alignment = Alignment(horizontal="center")
     ws.freeze_panes = "A2"
-    last_column = get_column_letter(len(TARGET_COLUMNS))
+    last_column = get_column_letter(len(columns))
     ws.auto_filter.ref = f"A1:{last_column}{max(row_count + 1, 1)}"
 
     widths = {
-        "date": 13,
-        "source": 14,
-        "campaign_name": 30,
-        "ad_name": 30,
-        "impressions": 14,
-        "clicks": 12,
-        "click_through_rate": 20,
-        "completed_views": 18,
-        "video_completion_rate": 22,
-        "25_percent_views": 18,
-        "50_percent_views": 18,
-        "75_percent_views": 18,
-        "ad_type": 16,
+        "Date": 13,
+        "Campaign name": 30,
+        "Adset name": 30,
+        "Ad Free Form": 30,
+        "Final URL": 40,
+        "Impressions": 14,
+        "Clicks (all)": 14,
+        "Spent (TWD)": 16,
+        "Campaign Type": 18,
     }
     column_letters = {
         target: get_column_letter(index)
-        for index, target in enumerate(TARGET_COLUMNS, start=1)
+        for index, target in enumerate(columns, start=1)
     }
-    for target, width in widths.items():
-        ws.column_dimensions[column_letters[target]].width = width
+    for target, column_letter in column_letters.items():
+        ws.column_dimensions[column_letter].width = widths.get(target, 18)
 
-    for cell in ws[column_letters["date"]][1:]:
-        cell.number_format = "yyyy-mm-dd"
-    for target in ("click_through_rate", "video_completion_rate"):
-        for cell in ws[column_letters[target]][1:]:
-            cell.number_format = "0.00%"
+    if "Date" in column_letters:
+        for cell in ws[column_letters["Date"]][1:]:
+            cell.number_format = "yyyy-mm-dd"
+    for target in ("Bounce Rate", "TVR", "10 Second TVR"):
+        if target in column_letters:
+            for cell in ws[column_letters[target]][1:]:
+                cell.number_format = "0.00%"
     for target in (
-        "impressions",
-        "clicks",
-        "completed_views",
-        "25_percent_views",
-        "50_percent_views",
-        "75_percent_views",
+        "Reach",
+        "Impressions",
+        "Clicks (all)",
+        "Link clicks (Web Clicks)",
+        "Views",
+        '3" Video Views',
+        '15" Video Views (ThruPlays)',
+        "TrueView: Views",
+        "Video played to 25%",
+        "Video played to 50%",
+        "Video played to 75%",
+        "Video played to 100%",
     ):
-        for cell in ws[column_letters[target]][1:]:
-            cell.number_format = "#,##0"
+        if target in column_letters:
+            for cell in ws[column_letters[target]][1:]:
+                cell.number_format = "#,##0"
+
+
+def _format_audit_sheet(
+    ws: Any,
+    row_count: int,
+    widths: dict[str, int],
+) -> None:
+    """Apply compact, consistent formatting to an audit worksheet."""
+    header_fill = PatternFill("solid", fgColor="5B6573")
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center")
+    ws.freeze_panes = "A2"
+    last_column = get_column_letter(ws.max_column)
+    ws.auto_filter.ref = f"A1:{last_column}{max(row_count + 1, 1)}"
+
+    header_columns = {
+        cell.value: get_column_letter(index)
+        for index, cell in enumerate(ws[1], start=1)
+    }
+    for header, width in widths.items():
+        column = header_columns.get(header)
+        if column:
+            ws.column_dimensions[column].width = width
+
+
+def consolidate_cleaned_workbooks(
+    cleaned_paths: Iterable[Path],
+    records: Iterable[AuditRecord],
+    output_path: Path,
+) -> int:
+    """Combine cleaned data and audit details into one Excel workbook."""
+    audit_records = list(records)
+    combined_records: list[dict[str, Any]] = []
+
+    for cleaned_path in cleaned_paths:
+        cleaned = load_workbook(cleaned_path, data_only=True, read_only=True)
+        try:
+            source_ws = (
+                cleaned["cleaned_data"]
+                if "cleaned_data" in cleaned.sheetnames
+                else cleaned.worksheets[0]
+            )
+            rows = source_ws.iter_rows(values_only=True)
+            headers = [clean_text(value) for value in next(rows, ())]
+            invalid_headers = [
+                header for header in headers if header and header not in TARGET_COLUMNS
+            ]
+            if invalid_headers:
+                raise ValueError(
+                    f"{cleaned_path.name} 含有非 template 欄位："
+                    f"{'、'.join(invalid_headers)}"
+                )
+            for row in rows:
+                record = {
+                    header: value
+                    for header, value in zip(headers, row)
+                    if header in TARGET_COLUMNS and not is_blank(value)
+                }
+                if record:
+                    combined_records.append(record)
+        finally:
+            cleaned.close()
+
+    output_columns = populated_columns(combined_records)
+    workbook = Workbook()
+    data_ws = workbook.active
+    data_ws.title = "cleaned_data"
+    data_ws.append(output_columns)
+    for record in combined_records:
+        data_ws.append([record.get(column) for column in output_columns])
+    total_rows = len(combined_records)
+    format_output(data_ws, total_rows, output_columns)
+
+    audit_ws = workbook.create_sheet("cleaning_audit")
+    audit_ws.append(
+        [
+            "input_file",
+            "sheet",
+            "header_row",
+            "status",
+            "score",
+            "data_rows",
+            "mapped_columns",
+            "unmapped_columns",
+            "output_file",
+        ]
+    )
+    for record in audit_records:
+        audit_ws.append(
+            [
+                record.input_file,
+                record.sheet,
+                record.header_row,
+                record.status,
+                record.score,
+                record.data_rows,
+                json.dumps(record.mapped_columns, ensure_ascii=False),
+                "、".join(record.unmapped_columns),
+                record.output_file,
+            ]
+        )
+    _format_audit_sheet(
+        audit_ws,
+        len(audit_records),
+        {
+            "input_file": 28,
+            "sheet": 20,
+            "header_row": 12,
+            "status": 28,
+            "score": 12,
+            "data_rows": 12,
+            "mapped_columns": 60,
+            "unmapped_columns": 36,
+            "output_file": 28,
+        },
+    )
+    for column in ("G", "H"):
+        for cell in audit_ws[column][1:]:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    unmapped_ws = workbook.create_sheet("unmapped_columns")
+    unmapped_ws.append(
+        ["input_file", "sheet", "header_row", "status", "unmapped_column"]
+    )
+    unmapped_rows = 0
+    for record in audit_records:
+        if record.unmapped_columns:
+            for column in record.unmapped_columns:
+                unmapped_ws.append(
+                    [
+                        record.input_file,
+                        record.sheet,
+                        record.header_row,
+                        record.status,
+                        column,
+                    ]
+                )
+                unmapped_rows += 1
+        elif record.status != "成功":
+            unmapped_ws.append(
+                [
+                    record.input_file,
+                    record.sheet,
+                    record.header_row,
+                    record.status,
+                    "",
+                ]
+            )
+            unmapped_rows += 1
+    _format_audit_sheet(
+        unmapped_ws,
+        unmapped_rows,
+        {
+            "input_file": 28,
+            "sheet": 20,
+            "header_row": 12,
+            "status": 28,
+            "unmapped_column": 36,
+        },
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(output_path)
+    workbook.close()
+    return total_rows
 
 
 def list_workbook_sheets(workbook_data: bytes) -> list[str]:
@@ -709,9 +885,8 @@ def clean_workbook_sheets(
 ) -> tuple[list[AuditRecord], int]:
     """Clean explicitly selected worksheets into one standardized output table.
 
-    Each worksheet is detected and audited independently. When more than one
-    worksheet is selected, its name is appended to ``source`` so merged rows
-    remain traceable to the originating worksheet.
+    Each worksheet is detected and audited independently. Originating file and
+    worksheet remain traceable through the audit output.
     """
     selected_sheets = list(dict.fromkeys(name for name in sheet_names if name))
     if not selected_sheets:
@@ -732,11 +907,9 @@ def clean_workbook_sheets(
     output = Workbook()
     out_ws = output.active
     out_ws.title = "cleaned_data"
-    out_ws.append(TARGET_COLUMNS)
     audit: list[AuditRecord] = []
+    cleaned_records: list[dict[str, Any]] = []
     total_rows = 0
-    source = infer_source(input_path)
-    include_sheet_in_source = len(selected_sheets) > 1
 
     try:
         for sheet_name in selected_sheets:
@@ -764,13 +937,9 @@ def clean_workbook_sheets(
                     )
                     continue
 
-                row_source = (
-                    f"{source} [{sheet_name}]" if include_sheet_in_source else source
-                )
                 ws = wb_values[candidate.sheet]
-                rows = list(iter_clean_rows(ws, candidate, row_source))
-                for record in rows:
-                    out_ws.append([record[column] for column in TARGET_COLUMNS])
+                rows = list(iter_clean_rows(ws, candidate))
+                cleaned_records.extend(rows)
                 total_rows += len(rows)
                 candidate.data_rows = len(rows)
                 mapped_columns = {
@@ -808,7 +977,11 @@ def clean_workbook_sheets(
         wb_values.close()
 
     if total_rows:
-        format_output(out_ws, total_rows)
+        output_columns = populated_columns(cleaned_records)
+        out_ws.append(output_columns)
+        for record in cleaned_records:
+            out_ws.append([record[column] for column in output_columns])
+        format_output(out_ws, total_rows, output_columns)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output.save(output_path)
     output.close()

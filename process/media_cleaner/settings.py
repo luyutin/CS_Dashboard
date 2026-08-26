@@ -5,13 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from process.template_schema import TEMPLATE_COLUMNS
+
 
 CONFIG_DIR = Path(__file__).resolve().parent / "config"
-REQUIRED_COLUMNS = {
-    "date", "source", "campaign_name", "ad_name", "impressions", "clicks",
-    "click_through_rate", "completed_views", "video_completion_rate",
-    "25_percent_views", "50_percent_views", "75_percent_views", "ad_type",
-}
 
 
 def _read_text(filename: str) -> str:
@@ -23,7 +20,6 @@ def _read_text(filename: str) -> str:
 
 
 def _load_target_schema() -> tuple[list[str], dict[str, str]]:
-    columns: list[str] = []
     descriptions: dict[str, str] = {}
     path = CONFIG_DIR / "target_columns.txt"
     for line_number, raw_line in enumerate(_read_text(path.name).splitlines(), start=1):
@@ -38,14 +34,19 @@ def _load_target_schema() -> tuple[list[str], dict[str, str]]:
         key, description = (part.strip() for part in parts)
         if key in descriptions:
             raise RuntimeError(f"{path} 第 {line_number} 行有重複欄位：{key}")
-        columns.append(key)
         descriptions[key] = description
-    if not columns:
+    if not descriptions:
         raise RuntimeError(f"{path} 沒有定義任何輸出欄位")
-    missing = REQUIRED_COLUMNS - descriptions.keys()
+    missing = set(TEMPLATE_COLUMNS) - descriptions.keys()
     if missing:
-        raise RuntimeError(f"{path} 缺少核心欄位：{', '.join(sorted(missing))}")
-    return columns, descriptions
+        raise RuntimeError(f"{path} 缺少 template 欄位：{', '.join(sorted(missing))}")
+    extra = descriptions.keys() - set(TEMPLATE_COLUMNS)
+    if extra:
+        raise RuntimeError(f"{path} 含有 template 未定義欄位：{', '.join(sorted(extra))}")
+    ordered_descriptions = {
+        column: descriptions[column] for column in TEMPLATE_COLUMNS
+    }
+    return list(TEMPLATE_COLUMNS), ordered_descriptions
 
 
 def _load_aliases() -> dict[str, tuple[str, ...]]:
@@ -58,14 +59,21 @@ def _load_aliases() -> dict[str, tuple[str, ...]]:
         raise RuntimeError(f"{path} 最外層必須是 JSON object")
 
     aliases: dict[str, tuple[str, ...]] = {}
-    for target, values in raw_aliases.items():
-        if target not in TARGET_DESCRIPTIONS:
-            raise RuntimeError(f"{path} 使用了 target_columns.txt 未定義的欄位：{target}")
-        if not isinstance(values, list) or not values or not all(
+    for target in TARGET_DESCRIPTIONS:
+        values = raw_aliases.get(target, [])
+        if not isinstance(values, list) or not all(
             isinstance(value, str) and value.strip() for value in values
         ):
-            raise RuntimeError(f"{path} 的 {target} 必須是非空字串陣列")
-        aliases[target] = tuple(value.strip() for value in values)
+            raise RuntimeError(f"{path} 的 {target} 必須是字串陣列")
+        aliases[target] = tuple(
+            dict.fromkeys([target, *(value.strip() for value in values)])
+        )
+    extra = raw_aliases.keys() - TARGET_DESCRIPTIONS.keys()
+    if extra:
+        raise RuntimeError(
+            f"{path} 使用了 target_columns.txt 未定義的欄位："
+            f"{', '.join(sorted(extra))}"
+        )
     return aliases
 
 

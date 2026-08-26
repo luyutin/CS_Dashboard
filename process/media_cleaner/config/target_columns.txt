@@ -1,15 +1,79 @@
-# 欄位 key<TAB>提供給 Ollama 的欄位定義
-# 順序就是 cleaned_data 工作表的輸出欄位順序；修改後請重啟程式。
-date	報表日期、投放日期或 reporting date
-source	來源檔案或資料來源識別
-campaign_name	廣告活動、訂單名稱、素材或 campaign 名稱
-ad_name	廣告、素材、訂單項目或 ad name
-impressions	曝光數、展示次數或 impressions
-clicks	點擊數或 clicks
-click_through_rate	點擊率、CTR（百分比）
-completed_views	僅限影片完整或播放至 100% 的次數；一般 video views 不屬於此欄
-video_completion_rate	影片完整觀看率、VTR、view/completion rate（必須是百分比率）
-25_percent_views	僅限明確寫出影片播放至 25% 的次數
-50_percent_views	僅限明確寫出影片播放至 50% 的次數
-75_percent_views	僅限明確寫出影片播放至 75% 的次數
-ad_type	廣告格式、媒體格式或 ad type；頻率、觸及人數不是廣告格式
+# 欄位名必須與 process/template.py::template() 完全相同；此處維護給 Ollama 的欄位說明。
+Region	廣告投放地區或區域
+Market	廣告投放市場或國別
+BU	事業單位或代理商單位
+Customer	客戶、廣告主或品牌名稱
+Date	報表日期、投放日期或 reporting date
+Duration	活動或投放週期
+Media	媒體來源，如 Google、Meta、LINE
+Platform	媒體下的平台，如 Facebook、Instagram
+Advertiser Currency	廣告主幣別或貨幣代碼
+Final URL	廣告最終到達網址或 landing page URL
+Item (Summary of filter)	匯總篩選項目或觀察群組名稱
+Account name	廣告帳戶名稱
+Campaign name	行銷或廣告活動名稱
+Campaign Objective	廣告活動目標
+Campaign Free Form	廣告活動自定義內容
+Adset name	廣告組合、廣告群組或 ad set 名稱
+Audience	投放受眾
+Adset Free Form	廣告組合自定義內容
+Message Type	廣告素材訊息類型
+Ad Free Form	廣告或素材自定義內容
+Adset MD	廣告組合情緒指標
+Product	產品名稱
+Channel	媒體渠道
+InName Site	網站或發行者名稱
+Campaign Type	廣告活動類型
+Buying Type	媒體購買方式
+Placement	廣告版位
+SEM Status	搜尋關鍵字狀態
+Reach	觸及人數
+Impressions	曝光或展示次數
+Clicks (all)	全部點擊次數
+Frequency	廣告頻率
+Link clicks (Web Clicks)	連結或網站點擊次數
+Spent (TWD)	以新台幣計算的媒體花費
+Purchases conversion value	購買轉換金額或訂單金額
+Conversions	轉換次數
+Conversion Value	轉換價值
+MV>5	MV 大於 5 的指標值
+Views	影片或內容觀看次數
+3" Video Views	影片播放至少 3 秒的次數
+15" Video Views (ThruPlays)	影片播放至少 15 秒或 ThruPlay 次數
+TrueView: Views	TrueView 觀看次數
+Video played to 25%	影片播放至 25% 的次數
+Video played to 50%	影片播放至 50% 的次數
+Video played to 75%	影片播放至 75% 的次數
+Video played to 100%	影片播放至 100% 的次數
+Fan page like	粉絲專頁按讚數
+Page Likes or followers	頁面喜歡或追蹤數
+Post comments	貼文留言數
+Post engagements	貼文互動次數
+Post reactions	貼文心情或反應數
+Post shares	貼文分享數
+Photo Views	照片觀看次數
+Post Saves	貼文儲存次數
+Adds to cart	加入購物車次數
+Purchases	購買次數
+Revenue	營收或收益
+Sales Engagement	銷售互動指標
+Purchase ROAS	購買廣告投資報酬率
+Quality Score	搜尋廣告品質分數
+Leads	潛在客戶或完成填單數
+Actions	動作或按鈕點擊次數
+View-through conversion	瀏覽後轉換次數
+Clicks conversion	點擊轉換次數
+View conversion	觀看轉換次數
+User number	使用者人數
+Total PPL	總人數
+New user	新使用者人數
+Working session	工作階段數
+Bounce Rate	跳出率
+Avg engagement time per session	每個工作階段平均互動時間
+Avg Working session time	平均工作階段時間
+GA Session name	GA 工作階段名稱
+GA Session Type	GA 工作階段類型
+GA Session Qty	GA 工作階段數量
+TVR	電視收視率
+10 Second TVR	10 秒收視率
+Reach 000s	以千人為單位的觸及人數

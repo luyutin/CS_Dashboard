@@ -69,16 +69,16 @@ and legacy project copies are intentionally excluded from Git.
 ### Unknown-data formatter maintenance
 
 The cleaner is a package under `process/media_cleaner/`. Its Python API is in
-`engine.py`; editable output fields and Ollama prompts are under
-`process/media_cleaner/config/`. `target_columns.txt` uses one tab-delimited
-`field_key<TAB>description` per line, and its order controls output-column order.
-Restart Streamlit after changing these text files.
+`engine.py`; editable aliases, field descriptions, and Ollama prompts are under
+`process/media_cleaner/config/`. The canonical field names and order come from
+`process/template.py::template()`. Completely empty columns are omitted from
+each output workbook. Restart Streamlit after changing these text files.
 
 On the Streamlit page, each uploaded workbook shows its worksheet names. Only
 the first worksheet is selected by default; users can explicitly include more.
 Selected worksheets are detected and audited independently, then merged into
-the workbook's cleaned output. For multi-sheet imports, the source value also
-contains the worksheet name so rows remain traceable.
+the workbook's cleaned output. Source file and worksheet remain traceable in
+the audit worksheets.
 
 The standalone CLI is:
 
