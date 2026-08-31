@@ -121,6 +121,49 @@ class MediaCleanerStructureTests(unittest.TestCase):
             )
             self.assertTrue(set(headers).issubset(TEMPLATE_COLUMNS))
 
+    def test_horizontal_total_rows_are_excluded(self):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Daily"
+        worksheet.append(["Date", "Campaign name", "Impressions"])
+        worksheet.append(["2026-08-01", "Campaign A", 100])
+        worksheet.append(["Grand Total", None, 100])
+        worksheet.append(["2026-08-02", "Total", 100])
+        worksheet.append([None, "Subtotal", 100])
+        worksheet.append([None, "總計：", 100])
+        worksheet.append([None, "小計", 100])
+        worksheet.append(["2026-08-03", "Total Awareness Campaign", 200])
+        memory_file = io.BytesIO()
+        workbook.save(memory_file)
+        workbook.close()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "report_with_totals.xlsx"
+            output_path = Path(temp_dir) / "report_with_totals_cleaned.xlsx"
+            input_path.write_bytes(memory_file.getvalue())
+
+            audit, row_count = media_cleaner.clean_workbook_sheets(
+                input_path=input_path,
+                output_path=output_path,
+                aliases=media_cleaner.read_dictionary(None),
+                scan_rows=20,
+                sheet_names=["Daily"],
+                ollama=media_cleaner.OllamaConfig(enabled=False),
+            )
+
+            self.assertEqual(row_count, 2)
+            self.assertEqual(audit[0].status, "成功")
+            cleaned = load_workbook(output_path, data_only=True, read_only=True)
+            try:
+                rows = list(cleaned["cleaned_data"].iter_rows(values_only=True))
+            finally:
+                cleaned.close()
+            campaign_index = rows[0].index("Campaign name")
+            self.assertEqual(
+                [row[campaign_index] for row in rows[1:]],
+                ["Campaign A", "Total Awareness Campaign"],
+            )
+
     def test_every_template_column_can_be_mapped_and_output(self):
         workbook = Workbook()
         worksheet = workbook.active

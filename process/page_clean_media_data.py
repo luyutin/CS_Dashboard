@@ -290,17 +290,20 @@ def main():
 
     st.subheader("下載")
     with st.expander("📦 輸出檔案", expanded=False):
-        st.download_button(
-            f"下載匯總結果（Excel，共 {results['consolidated_rows']:,} 列）",
-            data=results["consolidated"],
-            file_name="cleaned_media_results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="download_consolidated_cleaned_media",
-            type="primary",
-        )
-        st.caption(
-            "內含 cleaned_data、cleaning_audit、unmapped_columns 三張工作表。"
-        )
+        if results.get("consolidated") is not None:
+            st.download_button(
+                f"下載匯總結果（Excel，共 {results.get('consolidated_rows', 0):,} 列）",
+                data=results["consolidated"],
+                file_name="cleaned_media_results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_consolidated_cleaned_media",
+                type="primary",
+            )
+            st.caption(
+                "內含 cleaned_data、cleaning_audit、unmapped_columns 三張工作表。"
+            )
+        else:
+            st.info("目前是更新前的舊結果；請重新執行格式化以產生匯總 Excel。")
         if results["files"]:
             st.download_button(
                 "下載全部結果（ZIP）",

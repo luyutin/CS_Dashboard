@@ -42,7 +42,16 @@ except ImportError as exc:  # pragma: no cover - gives a useful CLI error
     raise SystemExit("缺少 openpyxl；請先執行：pip install openpyxl") from exc
 
 
-SUMMARY_MARKERS = ("合計", "總計", "total", "subtotal")
+SUMMARY_MARKERS = {
+    "total",
+    "grand total",
+    "overall total",
+    "subtotal",
+    "sub total",
+    "合計",
+    "總計",
+    "小計",
+}
 PREFERRED_SHEETS = ("daily", "每日", "by day", "byday")
 
 # ---------------------------------------------------------------------------
@@ -119,6 +128,18 @@ def is_blank(value: Any) -> bool:
 def is_error(value: Any) -> bool:
     """Return True for Excel error strings such as #DIV/0!."""
     return isinstance(value, str) and value.startswith("#")
+
+
+def is_summary_row(values: Iterable[Any]) -> bool:
+    """Return True when any cell explicitly labels a horizontal total row."""
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        label = clean_text(value).casefold()
+        label = re.sub(r"^[\s:：\-–—_]+|[\s:：\-–—_]+$", "", label)
+        if label in SUMMARY_MARKERS:
+            return True
+    return False
 
 
 def looks_like_date(value: Any) -> bool:
@@ -605,8 +626,7 @@ def iter_clean_rows(ws: Any, candidate: Candidate) -> Iterable[dict[str, Any]]:
                 break
             continue
         blank_streak = 0
-        first_text = clean_text(next((v for v in values if not is_blank(v)), "")).lower()
-        if any(marker == first_text for marker in SUMMARY_MARKERS):
+        if is_summary_row(values):
             continue
 
         record = {column: None for column in TARGET_COLUMNS}
